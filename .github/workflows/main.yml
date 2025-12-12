@@ -25,7 +25,8 @@ jobs:
 
     - name: Build EXE
       run: |
-        pyinstaller app_gui.py --onefile --noconsole --name SoccerPredictor
+        pyinstaller app_gui.py --onefile --noconsole --name SoccerPredictor --add-data "mvp_predictor.py;."
+
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
