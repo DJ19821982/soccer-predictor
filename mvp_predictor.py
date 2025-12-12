@@ -1,5 +1,4 @@
-import os, math, sqlite3
-import json
+import os, math, sqlite3, json
 from datetime import datetime
 from collections import defaultdict
 import requests
@@ -8,6 +7,10 @@ from scipy.stats import poisson
 
 DB_FILE = 'matches.db'
 
+
+# ============================================================
+# Database
+# ============================================================
 
 class DataStore:
     def __init__(self, path=DB_FILE):
@@ -39,29 +42,34 @@ class DataStore:
 
     def list_matches(self, competition=None, season=None, limit=None):
         c = self.conn.cursor()
-        q = 'SELECT date,competition,season,home_team,away_team,home_goals,away_goals FROM matches WHERE home_goals IS NOT NULL'
+
+        q = """
+        SELECT date, competition, season, home_team, away_team, home_goals, away_goals
+        FROM matches
+        WHERE home_goals IS NOT NULL
+        """
         params = []
 
         if competition:
-            q += ' AND competition=?'
+            q += " AND competition=?"
             params.append(competition)
 
         if season:
-            q += ' AND season=?'
+            q += " AND season=?"
             params.append(season)
 
-        q += ' ORDER BY date ASC'
+        q += " ORDER BY date ASC"
 
         if limit:
-            q += f' LIMIT {limit}'
+            q += f" LIMIT {limit}"
 
         c.execute(q, params)
         return c.fetchall()
 
 
-# ----------------------------------------------------------
-# Data ingestion from football-data.org
-# ----------------------------------------------------------
+# ============================================================
+# Football-data.org ingestion
+# ============================================================
 
 def fetch_from_football_data(comp, season=None, api_key=None):
     if api_key is None:
@@ -83,10 +91,12 @@ def fetch_from_football_data(comp, season=None, api_key=None):
         date = m.get('utcDate', '')[:10]
         home = m.get('homeTeam', {}).get('name')
         away = m.get('awayTeam', {}).get('name')
+
         score = m.get('score', {}).get('fullTime', {})
         hg = score.get('home')
         ag = score.get('away')
 
+        # Extract season year
         season_year = None
         s = m.get('season', {}).get('startDate')
         if s:
@@ -102,15 +112,56 @@ def fetch_from_football_data(comp, season=None, api_key=None):
 
 def ingest_football_data_competition(ds, comp, season=None, api_key=None):
     data = fetch_from_football_data(comp, season=season, api_key=api_key)
+
     for date, comp, season_year, home, away, hg, ag in data:
         if home and away:
             ds.add_match(date, comp, season_year or 0, home, away, hg, ag)
+
     return len(data)
 
 
-# ----------------------------------------------------------
-# Poisson model + Elo
-# ----------------------------------------------------------
+# ============================================================
+# Local openfootball ingestion (folder of JSONL files)
+# ============================================================
+
+def ingest_openfootball_folder(ds, folder):
+    """Load matches from newline-delimited JSON files."""
+    total = 0
+
+    for fname in os.listdir(folder):
+        path = os.path.join(folder, fname)
+        if not os.path.isfile(path):
+            continue
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    j = json.loads(line)
+
+                    date = j.get("date")
+                    competition = j.get("competition", "OPEN")
+                    season = j.get("season", 0)
+                    home = j.get("home")
+                    away = j.get("away")
+                    hg = j.get("home_goals")
+                    ag = j.get("away_goals")
+
+                    if home and away:
+                        ds.add_match(date, competition, season, home, away, hg, ag)
+                        total += 1
+
+        except Exception as e:
+            print("Skipping file:", path, "Error:", e)
+
+    return total
+
+
+# ============================================================
+# Elo rating
+# ============================================================
 
 class EloRatings:
     def __init__(self, k=20, base=1500):
@@ -124,15 +175,21 @@ class EloRatings:
 
     def update(self, a, b, a_goals, b_goals):
         ea = self.expected(a, b)
+
         if a_goals > b_goals:
             sa = 1.0
         elif a_goals == b_goals:
             sa = 0.5
         else:
             sa = 0.0
+
         self.ratings[a] += self.k * (sa - ea)
         self.ratings[b] += self.k * ((1 - sa) - (1 - ea))
 
+
+# ============================================================
+# Poisson strength modeling
+# ============================================================
 
 def fit_poisson_strengths(matches):
     teams = set()
@@ -148,6 +205,7 @@ def fit_poisson_strengths(matches):
         home, away, hg, ag = m[3], m[4], m[5], m[6]
         if hg is None or ag is None:
             continue
+
         attack[home] += hg
         defense[home] += ag
         games[home] += 1
@@ -160,8 +218,16 @@ def fit_poisson_strengths(matches):
     total_games = sum(games.values()) if sum(games.values()) > 0 else 1
     avg_goals = total_goals / total_games
 
-    atk = {t: (attack[t] / games[t]) / avg_goals if games[t] > 0 else 1.0 for t in teams}
-    defn = {t: (defense[t] / games[t]) / avg_goals if games[t] > 0 else 1.0 for t in teams}
+    atk = {}
+    defn = {}
+
+    for t in teams:
+        if games[t] > 0:
+            atk[t] = (attack[t] / games[t]) / avg_goals
+            defn[t] = (defense[t] / games[t]) / avg_goals
+        else:
+            atk[t] = 1.0
+            defn[t] = 1.0
 
     return atk, defn, avg_goals
 
@@ -192,6 +258,10 @@ def predict_match_poisson(home, away, atk, defn, avg_goals, home_adv=1.05):
     }
 
 
+# ============================================================
+# Model building & prediction
+# ============================================================
+
 def build_models(ds, competition=None, season=None):
     matches = ds.list_matches(competition=competition, season=season)
     complete = [m for m in matches if m[5] is not None and m[6] is not None]
@@ -202,12 +272,17 @@ def build_models(ds, competition=None, season=None):
     for m in complete:
         elo.update(m[3], m[4], m[5], m[6])
 
-    return {"atk": atk, "defn": defn, "avg_goals": avg, "elo": elo}
+    return {
+        "atk": atk,
+        "defn": defn,
+        "avg_goals": avg,
+        "elo": elo
+    }
 
 
 def predict_for_upcoming(ds, models, competition=None, season=None):
     c = ds.conn.cursor()
-    q = "SELECT date,competition,season,home_team,away_team FROM matches WHERE home_goals IS NULL"
+    q = "SELECT date, competition, season, home_team, away_team FROM matches WHERE home_goals IS NULL"
     params = []
 
     if competition:
