@@ -1,0 +1,6 @@
+
+SAMPLE openfootball instructions:
+- Create a folder, e.g. C:\\data\\openfootball
+- Create files like 'pl_2023.jsonl' with newline JSON objects per match:
+  {"date":"2023-08-12","competition":"PL","season":2023,"home":"Manchester United FC","away":"Chelsea FC","home_goals":1,"away_goals":1}
+- Use the GUI button 'Load openfootball folder' to import.
